@@ -1,0 +1,1 @@
+An unspectacular Vanilla GAN
