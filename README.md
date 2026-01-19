@@ -1,1 +1,1 @@
-An unspectacular Vanilla GAN
+Vanilla GAN and DC GAN
