@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader, Subset
 import os
 from datetime import datetime
 import time
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
 
         
 # =========================================================
@@ -136,8 +138,16 @@ if __name__ == "__main__":
     netG = Generator(noise_dim).to(device)
     netD = Discriminator().to(device)
 
-    netG.apply(weights_init)
-    netD.apply(weights_init)
+
+    # Load saved weights if they exist
+    try:
+        netG.load_state_dict(torch.load('generator.pth'))
+        netD.load_state_dict(torch.load('discriminator.pth'))
+        print("Loaded pre-trained models")
+    except FileNotFoundError:
+        print("No saved models found, starting from scratch")
+        netG.apply(weights_init)
+        netD.apply(weights_init)
 
     print(netG)
     print(netD)
@@ -153,10 +163,19 @@ if __name__ == "__main__":
     real_label = 0.9
     fake_label = 0.0
 
+    # Initialize FID and IS metrics
+    fid_metric = FrechetInceptionDistance(normalize=True).to(device)
+    is_metric = InceptionScore(normalize=True).to(device)
+
+    metric_eval_freq = 10  # Evaluate FID/IS every N epochs
+
     # Training Loop
     img_list = []
     G_losses = []
     D_losses = []
+    fid_scores = []
+    is_scores = []
+    epochs_list = []
 
     print("Starting Training Loop...")
     startTime = time.monotonic()
@@ -209,7 +228,54 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             fake = netG(fixed_noise).detach().cpu()
-        img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
+            img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
+
+            if epoch % metric_eval_freq == 0:
+
+                # Generate samples for FID/IS computation
+                num_samples = 500
+                batch_size_eval = 64
+                fake_images = []
+                real_images = []
+                
+                for batch_idx, batch_data in enumerate(dataloader):
+                    if batch_idx * batch_size_eval >= num_samples:
+                        break
+                    real_batch = batch_data[0].to(device)
+                    real_images.append(real_batch)
+                
+                real_images = torch.cat(real_images, dim=0)[:num_samples]
+                
+                for _ in range((num_samples + batch_size_eval - 1) // batch_size_eval):
+                    z = torch.randn(batch_size_eval, noise_dim, 1, 1, device=device)
+                    fake_batch = netG(z)
+                    fake_images.append(fake_batch.detach())
+                
+                fake_images = torch.cat(fake_images, dim=0)[:num_samples]
+                
+                # Denormalize images for metric computation (scale from [-1,1] to [0,255])
+                real_images_denorm = ((real_images + 1) / 2 * 255).byte()
+                fake_images_denorm = ((fake_images + 1) / 2 * 255).byte()
+                
+                # Compute FID
+                fid_metric.update(real_images_denorm, real=True)
+                fid_metric.update(fake_images_denorm, real=False)
+                fid_score = fid_metric.compute()
+                fid_scores.append(fid_score.item())
+                fid_metric.reset()
+                
+                # Compute IS
+                is_metric.update(fake_images_denorm)
+                is_score = is_metric.compute()
+                is_scores.append(is_score[0].item())
+                is_metric.reset()
+                
+                epochs_list.append(epoch)
+                print(f"Epoch [{epoch}/{num_epochs}] - FID: {fid_score:.4f}, IS: {is_score[0]:.4f}")
+
+
+    endTime = time.monotonic()
+    print(f"Training completed in {endTime - startTime:.2f} seconds")
 
     # ------------------------------------------------
     # Plots
@@ -234,7 +300,7 @@ if __name__ == "__main__":
     plt.ylabel("Loss")
     plt.legend()
     plt.savefig(os.path.join(output_folder, f"loss_curves_{timestamp}.png"), dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.close()
         
     G_variance = moving_variance(G_losses)
     D_variance = moving_variance(D_losses)
@@ -245,7 +311,7 @@ if __name__ == "__main__":
     plt.ylabel("Variance")
     plt.legend()   
     plt.savefig(os.path.join(output_folder, f"loss_variance_{timestamp}.png"), dpi=300, bbox_inches='tight')
-    plt.show()     
+    plt.close()
 
     plt.plot(smooth(G_losses), label="Generator Loss (smoothed)")
     plt.plot(smooth(D_losses), label="Discriminator Loss (smoothed)")
@@ -254,8 +320,30 @@ if __name__ == "__main__":
     plt.ylabel("Loss")
     plt.legend()
     plt.savefig(os.path.join(output_folder, f"smoothed_loss_curves_{timestamp}.png"), dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.close()
     
+    # FID and IS Scores
+    if fid_scores and is_scores:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        ax1.plot(epochs_list, fid_scores, marker='o', label="FID Score", color='blue')
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("FID Score (lower is better)")
+        ax1.set_title("Frechet Inception Distance")
+        ax1.legend()
+        ax1.grid(True)
+        
+        ax2.plot(epochs_list, is_scores, marker='o', label="IS Score", color='green')
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("IS Score (higher is better)")
+        ax2.set_title("Inception Score")
+        ax2.legend()
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, f"fid_is_{timestamp}.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+
     # ------------------------------------------------
     # Images
     # ------------------------------------------------
@@ -275,7 +363,9 @@ if __name__ == "__main__":
     plt.imshow(np.transpose(img_list[-1], (1,2,0)))     # last generated batch
 
     plt.savefig(os.path.join(output_folder, f"real_vs_fake_{timestamp}.png"), dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.close()
+    
+    print(f"All plots saved to: {output_folder}")
     
     # ------------------------------------------------
     # Save training parameters in a text file
@@ -296,7 +386,7 @@ if __name__ == "__main__":
         f.write(f"Number of Channels: {nc}\n")
         f.write(f"Optimizer: Adam\n")
         f.write(f"Loss Function: BCELoss\n")
-        f.write(f"Total Training Time: {time.monotonic() - startTime:.2f} seconds\n\n")
+        f.write(f"Total Training Time: {endTime - startTime:.2f} seconds\n\n")
         
         f.write(netG.__str__() + "\n\n")
         f.write(netD.__str__() + "\n")
