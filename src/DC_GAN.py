@@ -13,6 +13,7 @@ from datetime import datetime
 import time
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
+import csv
 
         
 # =========================================================
@@ -104,13 +105,13 @@ if __name__ == "__main__":
     image_size = 32
     nc = 3
     noise_dim = 100
-    num_epochs = 200     # 200
+    num_epochs = 1     # 200
     #lr = 0.0002
     lrD = 0.00015
     lrG = 0.0002
 
     beta1 = 0.5
-    workers = 4         
+    workers = 0 if device.type == "cpu" else 4         
 
     # Dataset transformations
     transform = transforms.Compose([
@@ -138,7 +139,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=workers,
         drop_last=True,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         persistent_workers=True if workers > 0 else False,
         prefetch_factor=4 if workers > 0 else None
     )
@@ -154,8 +155,8 @@ if __name__ == "__main__":
 
     # Load saved weights if they exist
     try:
-        netG.load_state_dict(torch.load('config/generator.pth'))
-        netD.load_state_dict(torch.load('config/discriminator.pth'))
+        netG.load_state_dict(torch.load('config/generator.pth', map_location=device))
+        netD.load_state_dict(torch.load('config/discriminator.pth', map_location=device))
         print("Loaded pre-trained models")
     except FileNotFoundError:
         print("No saved models found, starting from scratch")
@@ -320,21 +321,23 @@ if __name__ == "__main__":
                 real_images_denorm = ((real_images + 1) / 2 * 255).byte()
                 fake_images_denorm = ((fake_images + 1) / 2 * 255).byte()
                 
-                # Compute FID
-                fid_metric.update(real_images_denorm, real=True)
-                fid_metric.update(fake_images_denorm, real=False)
-                fid_score = fid_metric.compute()
-                fid_scores.append(fid_score.item())
-                fid_metric.reset()
-                
-                # Compute IS
-                is_metric.update(fake_images_denorm)
-                is_score = is_metric.compute()
-                is_scores.append(is_score[0].item())
-                is_metric.reset()
-                
-                epochs_list.append(epoch)
-                print(f"Epoch [{epoch}/{num_epochs}] - FID: {fid_score:.4f}, IS: {is_score[0]:.4f}")
+                # Compute FID and IS with error handling
+                try:
+                    fid_metric.update(real_images_denorm, real=True)
+                    fid_metric.update(fake_images_denorm, real=False)
+                    fid_score = fid_metric.compute()
+                    fid_scores.append(fid_score.item())
+                    fid_metric.reset()
+                    
+                    is_metric.update(fake_images_denorm)
+                    is_score = is_metric.compute()
+                    is_scores.append(is_score[0].item())
+                    is_metric.reset()
+                    
+                    epochs_list.append(epoch)
+                    print(f"Epoch [{epoch}/{num_epochs}] - FID: {fid_score:.4f}, IS: {is_score[0]:.4f}")
+                except Exception as e:
+                    print(f"Warning: Could not compute metrics at epoch {epoch}: {e}")
 
 
     endTime = time.monotonic()
@@ -445,15 +448,38 @@ if __name__ == "__main__":
         f.write(f"Target Class (CIFAR-10): {target_class}\n")
         f.write(f"Number of Epochs: {num_epochs}\n")
         f.write(f"Batch Size: {batch_size}\n")
-        f.write(f"Learning Rate (Generator): {lrG}\n")
-        f.write(f"Learning Rate (Discriminator): {lrD}\n")
+        f.write(f"Learning Rate Generator: {lrG}\n")
+        f.write(f"Learning Rate Discriminator: {lrD}\n")
         f.write(f"Beta1: {beta1}\n")
         f.write(f"Noise Dimension: {noise_dim}\n")
         f.write(f"Image Size: {image_size}x{image_size}\n")
         f.write(f"Number of Channels: {nc}\n")
-        f.write(f"Optimizer: Adam\n")
-        f.write(f"Loss Function: BCELoss\n")
+        f.write(f"Optimizer Discriminator: {optimizerD.__str__()}\n")
+        f.write(f"Optimizer Generator: {optimizerG.__str__()}\n")
+        f.write(f"Loss Function: {criterion.__str__()}\n")
         f.write(f"Total Training Time: {endTime - startTime:.2f} seconds\n\n")
         
         f.write(netG.__str__() + "\n\n")
         f.write(netD.__str__() + "\n")
+        
+    print(f"Training parameters saved to: {param_file}")
+        
+    # ------------------------------------------------
+    # Export csv file for loss values and metrics
+    # ------------------------------------------------
+    with open(os.path.join(output_folder, "losses_and_metrics.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Iteration", "Generator Loss", "Discriminator Loss", "Epoch", "FID Score", "IS Score"])
+
+        for i in range(max(len(G_losses), len(epochs_list))):
+            writer.writerow([
+                i,
+                G_losses[i],
+                D_losses[i],
+                epochs_list[i] if i < len(epochs_list) else None,
+                fid_scores[i] if i < len(fid_scores) else None,
+                is_scores[i] if i < len(is_scores) else None
+            ])
+            
+    print(f"Losses and metrics exported to: {os.path.join(output_folder, 'losses_and_metrics.csv')}")
+            
