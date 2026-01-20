@@ -60,7 +60,7 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
 
             nn.Conv2d(512, 1, 4, 1, 0, bias=False),
-            nn.Sigmoid()
+            #nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -93,18 +93,24 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
+    # Enable performance optimizations
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+
     # Hyperparameters
-    batch_size = 64
+    batch_size = 128
     image_size = 32
     nc = 3
     noise_dim = 100
-    num_epochs = 1     # 200
+    num_epochs = 200     # 200
     #lr = 0.0002
     lrD = 0.00015
     lrG = 0.0002
 
     beta1 = 0.5
-    workers = 2         
+    workers = 4         
 
     # Dataset transformations
     transform = transforms.Compose([
@@ -131,29 +137,46 @@ if __name__ == "__main__":
         batch_size=batch_size,
         shuffle=True,
         num_workers=workers,
-        drop_last=True
+        drop_last=True,
+        pin_memory=True,
+        persistent_workers=True if workers > 0 else False,
+        prefetch_factor=4 if workers > 0 else None
     )
 
     # Build models
     netG = Generator(noise_dim).to(device)
     netD = Discriminator().to(device)
 
+    # Convert to channels_last for better conv performance
+    if device.type == "cuda":
+        netG = netG.to(memory_format=torch.channels_last)
+        netD = netD.to(memory_format=torch.channels_last)
 
     # Load saved weights if they exist
     try:
-        netG.load_state_dict(torch.load('generator.pth'))
-        netD.load_state_dict(torch.load('discriminator.pth'))
+        netG.load_state_dict(torch.load('config/generator.pth'))
+        netD.load_state_dict(torch.load('config/discriminator.pth'))
         print("Loaded pre-trained models")
     except FileNotFoundError:
         print("No saved models found, starting from scratch")
         netG.apply(weights_init)
         netD.apply(weights_init)
 
+    # Compile models for faster execution 
+    if device.type == "cuda":
+        try:
+            netG = torch.compile(netG)
+            netD = torch.compile(netD)
+            print("Models compiled successfully")
+        except Exception as e:
+            print(f"Model compilation not available: {e}")
+
     print(netG)
     print(netD)
 
     # Loss & Optimizers
-    criterion = nn.BCELoss()
+    #criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     optimizerD = optim.Adam(netD.parameters(), lr=lrD, betas=(beta1, 0.999))
     optimizerG = optim.Adam(netG.parameters(), lr=lrG, betas=(beta1, 0.999))
@@ -163,11 +186,19 @@ if __name__ == "__main__":
     real_label = 0.9
     fake_label = 0.0
 
+    # Pre-allocate tensors for training loop
+    noise = torch.randn(batch_size, noise_dim, 1, 1, device=device)
+    label_real = torch.full((batch_size,), real_label, device=device, dtype=torch.float32)
+    label_fake = torch.full((batch_size,), fake_label, device=device, dtype=torch.float32)
+
+    # Initialize AMP scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+
     # Initialize FID and IS metrics
     fid_metric = FrechetInceptionDistance(normalize=True).to(device)
     is_metric = InceptionScore(normalize=True).to(device)
 
-    metric_eval_freq = 10  # Evaluate FID/IS every N epochs
+    metric_eval_freq = 25  # Evaluate FID/IS every N epochs
 
     # Training Loop
     img_list = []
@@ -182,40 +213,72 @@ if __name__ == "__main__":
 
     for epoch in range(num_epochs):
         for i, data in enumerate(dataloader):
+            b_size = data[0].size(0)
+            real = data[0].to(device, non_blocking=True)
+            if device.type == "cuda":
+                real = real.to(memory_format=torch.channels_last)
 
+            # Update pre-allocated label tensors if batch size differs
+            if b_size != batch_size:
+                label_real_batch = label_real[:b_size]
+                label_fake_batch = label_fake[:b_size]
+            else:
+                label_real_batch = label_real
+                label_fake_batch = label_fake
 
-            # Discriminator
-            netD.zero_grad()
+            # ============================
+            # Train Discriminator
+            # ============================
+            netD.zero_grad(set_to_none=True)
 
-            real = data[0].to(device)
-            b_size = real.size(0)
-            label = torch.full((b_size,), real_label, device=device)
+            if device.type == "cuda" and scaler is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    output = netD(real)
+                    errD_real = criterion(output, label_real_batch)
+                scaler.scale(errD_real).backward()
 
-            output = netD(real)
-            errD_real = criterion(output, label)
-            errD_real.backward()
+                # Generate fake images
+                noise.normal_()
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    fake = netG(noise[:b_size])
+                    output = netD(fake.detach())
+                    errD_fake = criterion(output, label_fake_batch)
+                scaler.scale(errD_fake).backward()
 
-            noise = torch.randn(b_size, noise_dim, 1, 1, device=device)
-            fake = netG(noise)
-            label.fill_(fake_label)
+                scaler.step(optimizerD)
+                scaler.update()
+            else:
+                output = netD(real)
+                errD_real = criterion(output, label_real_batch)
+                errD_real.backward()
 
-            output = netD(fake.detach())
-            errD_fake = criterion(output, label)
-            errD_fake.backward()
+                noise.normal_()
+                fake = netG(noise[:b_size])
+                output = netD(fake.detach())
+                errD_fake = criterion(output, label_fake_batch)
+                errD_fake.backward()
 
-            optimizerD.step()
+                optimizerD.step()
 
             errD = errD_real + errD_fake
 
+            # ============================
+            # Train Generator
+            # ============================
+            netG.zero_grad(set_to_none=True)
 
-            # Generator
-            netG.zero_grad()
-            label.fill_(real_label)
-
-            output = netD(fake)
-            errG = criterion(output, label)
-            errG.backward()
-            optimizerG.step()
+            if device.type == "cuda" and scaler is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    output = netD(fake)
+                    errG = criterion(output, label_real_batch)
+                scaler.scale(errG).backward()
+                scaler.step(optimizerG)
+                scaler.update()
+            else:
+                output = netD(fake)
+                errG = criterion(output, label_real_batch)
+                errG.backward()
+                optimizerG.step()
 
             if i % 50 == 0:
                 print(f"[{epoch}/{num_epochs}] "
@@ -276,6 +339,10 @@ if __name__ == "__main__":
 
     endTime = time.monotonic()
     print(f"Training completed in {endTime - startTime:.2f} seconds")
+
+    # Save models
+    torch.save(netG.state_dict(), 'config/generator.pth')
+    torch.save(netD.state_dict(), 'config/discriminator.pth')
 
     # ------------------------------------------------
     # Plots
