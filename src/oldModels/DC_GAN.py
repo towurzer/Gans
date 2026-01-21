@@ -113,6 +113,7 @@ if __name__ == "__main__":
     beta1 = 0.5
     workers = 0 if device.type == "cpu" else 4         
 
+
     # Dataset transformations
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -220,6 +221,7 @@ if __name__ == "__main__":
                 real = real.to(memory_format=torch.channels_last)
 
             # Update pre-allocated label tensors if batch size differs
+            # If we compute this every time, why even pre compute it
             if b_size != batch_size:
                 label_real_batch = label_real[:b_size]
                 label_fake_batch = label_fake[:b_size]
@@ -231,7 +233,6 @@ if __name__ == "__main__":
             # Train Discriminator
             # ============================
             netD.zero_grad(set_to_none=True)
-
             if device.type == "cuda" and scaler is not None:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     output = netD(real)
@@ -356,7 +357,7 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))     # directory of this script
     parent_dir = os.path.dirname(script_dir)                    # one level up
 
-    logs_dir = os.path.join(parent_dir, "logs")
+    logs_dir = os.path.join(parent_dir, "../logs")
     os.makedirs(logs_dir, exist_ok=True)                       # ensure logs/ exists
 
     output_folder = os.path.join(logs_dir, f"{timestamp}_DCGAN_output")
