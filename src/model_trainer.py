@@ -164,11 +164,11 @@ class DCGANTrainer:
 			if i % 50 == 0:
 				print(f"[{epoch}/{self.cfg.num_epochs}] "
 				      f"[{i}/{len(self.dataloader)}] "
-				      f"Loss_D: {errD.item():.4f} "
-				      f"Loss_G: {errG.item():.4f}")
+				      f"Loss_D: {errD:.4f} "
+				      f"Loss_G: {errG:.4f}")
 
-			self.g_losses.append(errG.item())
-			self.d_losses.append(errD.item())
+			self.g_losses.append(errG)
+			self.d_losses.append(errD)
 
 	def evaluate(self, epoch):
 		"""Computes FID and IS scores."""
