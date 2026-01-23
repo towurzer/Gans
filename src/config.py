@@ -12,11 +12,11 @@ class Config:
 	num_workers: int = 4 if torch.cuda.is_available() else 0
 
 	# Hyperparameters
-	batch_size: int = 128
+	batch_size: int = 64
 	image_size: int = 32
 	nc: int = 3  # Number of channels (RGB vs Grayscale)
 	noise_dim: int = 100  # Noise dimension
-	num_epochs: int = 1
+	num_epochs: int = 200
 	num_samples_eval: int = 500
 
 	# Optimization
@@ -30,6 +30,6 @@ class Config:
 	target_class: int = 1  # 1 = car
 
 	# Paths & Logging
-	save_dir: str = "../logs"
-	model_save_path: str = "../config"
+	save_dir: str = "./logs"
+	model_save_path: str = "./config"
 	metric_eval_freq: int = 25  # Evaluate FID/IS every N epochs

@@ -167,7 +167,8 @@ class DCGANTrainer:
 				      f"Loss_D: {errD:.4f} "
 				      f"Loss_G: {errG:.4f}")
 
-			self.g_losses.append(errG)
+			# Store scalar values on CPU to avoid GPU tensors leaking into numpy/plotting
+			self.g_losses.append(errG.item())
 			self.d_losses.append(errD)
 
 	def evaluate(self, epoch):
@@ -252,7 +253,7 @@ class DCGANTrainer:
 
 		for epoch in range(self.cfg.num_epochs):
 			self.train_epoch(epoch)
-			self.save_progress(epoch)
+			#self.save_progress(epoch)
 
 			if epoch % self.cfg.metric_eval_freq == 0:
 				self.evaluate(epoch)
