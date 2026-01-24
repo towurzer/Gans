@@ -9,7 +9,10 @@ def get_dataloader(cfg):
 	The Target class is specified in config.py under 'target_class'
 	"""
 	transform = transforms.Compose([
-		transforms.Resize(cfg.image_size),  # added resize in case we do in fact now go for 64x64
+		transforms.Resize(cfg.image_size),  # keep target size
+		transforms.RandomHorizontalFlip(p=0.5),  # orientation-preserving diversity
+		transforms.RandomCrop(size=cfg.image_size, padding=4, padding_mode="reflect"),  # shifts without rotation
+		transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),  # milder color variation
 		transforms.ToTensor(),  # converts the PIL image to [0, 255] to a Tensor [0, 1]
 		transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # normalises the [0, 1] to a [-1, 1] tensor
 	])

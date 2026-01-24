@@ -15,13 +15,13 @@ class Config:
 	batch_size: int = 64
 	image_size: int = 32
 	nc: int = 3  # Number of channels (RGB vs Grayscale)
-	noise_dim: int = 100  # Noise dimension
+	noise_dim: int = 120  # Noise dimension
 	num_epochs: int = 200
 	num_samples_eval: int = 500
 
 	# Optimization
-	lr_d: float = 0.00015  # Learning Rate Discriminator
-	lr_g: float = 0.0002  # Learning Rate Generator
+	lr_d: float = 0.00012  # Learning Rate Discriminator (balanced with G)
+	lr_g: float = 0.00012  # Learning Rate Generator (raised to keep G signal)
 	beta1: float = 0.5  # Standard is .9 but Paper suggests .5 is better for stability
 
 	# Data
@@ -32,4 +32,4 @@ class Config:
 	# Paths & Logging
 	save_dir: str = "./logs"
 	model_save_path: str = "./config"
-	metric_eval_freq: int = 25  # Evaluate FID/IS every N epochs
+	metric_eval_freq: int = 50  # Evaluate FID/IS every N epochs

@@ -41,14 +41,27 @@ class DCGANTrainer:
 		self.setup_device_specifics()
 		# Load saved weights or initiate random weights if none are saved.
 		self.initialize_weights()
+		# Exponential Moving Average of generator weights for stabler evals
+		self.init_ema()
 
 		print(self.netG)
 		print(self.netD)
 
 		# Optimizers & Loss
-		self.criterion = nn.BCEWithLogitsLoss()
+		# Hinge loss: max(0, 1 - D_real) + max(0, 1 + D_fake)
+		# Works better with spectral norm D and gives cleaner gradients than BCEWithLogits
+		self.use_hinge_loss = True
 		self.optimizerD = optim.Adam(self.netD.parameters(), lr=cfg.lr_d, betas=(cfg.beta1, 0.999))
 		self.optimizerG = optim.Adam(self.netG.parameters(), lr=cfg.lr_g, betas=(cfg.beta1, 0.999))
+		# Cosine decay for D to taper smoothly across full training
+		self.schedulerD = optim.lr_scheduler.CosineAnnealingLR(
+			self.optimizerD, T_max=self.cfg.num_epochs, eta_min=self.cfg.lr_d * 0.1
+		)
+
+		# Best FID tracking (EMA generator)
+		self.best_fid = float("inf")
+		self.best_epoch = -1
+		self.best_ema_path = None
 
 		# Metrics
 		self.fixed_noise = torch.randn(64, cfg.noise_dim, 1, 1, device=self.device)
@@ -96,6 +109,32 @@ class DCGANTrainer:
 			self.netG.apply(weights_init)
 			self.netD.apply(weights_init)
 
+	def init_ema(self):
+		self.ema_decay = 0.999
+		self.ema_netG = Generator(self.cfg.noise_dim, self.cfg.nc).to(self.device)
+		self.ema_netG.load_state_dict(self.netG.state_dict())
+		self.ema_netG.eval()
+		for p in self.ema_netG.parameters():
+			p.requires_grad = False
+
+	@torch.no_grad()
+	def update_ema(self):
+		# Update EMA weights with current generator parameters
+		model_params = dict(self.netG.named_parameters())
+		ema_params = dict(self.ema_netG.named_parameters())
+		for name, param in model_params.items():
+			ema_params[name].data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
+
+		# Keep BatchNorm/other buffers in sync
+		model_buffers = dict(self.netG.named_buffers())
+		ema_buffers = dict(self.ema_netG.named_buffers())
+		for name, buf in model_buffers.items():
+			ema_buf = ema_buffers[name]
+			if buf.is_floating_point():
+				ema_buf.data.mul_(self.ema_decay).add_(buf.data, alpha=1 - self.ema_decay)
+			else:
+				ema_buf.data.copy_(buf.data)
+
 	def train_epoch(self, epoch):
 		"""Runs one full epoch of training."""
 		for i, data in enumerate(self.dataloader):
@@ -105,11 +144,12 @@ class DCGANTrainer:
 			real = data[0].to(self.device, non_blocking=True)
 			if self.device.type == "cuda":
 				real = real.to(memory_format=torch.channels_last)
+			real.requires_grad_(True)
 
 			# Generate inputs
 			noise = torch.randn(b_size, self.cfg.noise_dim, 1, 1, device=self.device)
 			label_real = torch.full((b_size,), 0.9, device=self.device)
-			label_fake = torch.full((b_size,), 0.0, device=self.device)
+			label_fake = torch.full((b_size,), 0.1, device=self.device)
 
 			# Train Discriminator
 			self.netD.zero_grad(set_to_none=True)
@@ -118,7 +158,15 @@ class DCGANTrainer:
 			# Use AMP if available
 			with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
 				output_real = self.netD(real)
-				errD_real = self.criterion(output_real, label_real)
+				# Hinge loss: penalize D if it underestimates real score (want D_real >= 1)
+				errD_real = torch.nn.functional.relu(1.0 - output_real).mean()
+
+				# R1 penalty on real images applied sparsely to avoid over-regularizing D
+				r1_gamma = 0.5
+				if i % 16 == 0:
+					grad_real = torch.autograd.grad(outputs=output_real.sum(), inputs=real, create_graph=True)[0]
+					grad_penalty = grad_real.pow(2).reshape(b_size, -1).sum(dim=1).mean()
+					errD_real = errD_real + 0.5 * r1_gamma * grad_penalty
 
 				# Backward pass
 				if self.scaler:
@@ -130,15 +178,21 @@ class DCGANTrainer:
 			with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
 				fake = self.netG(noise)
 				output_fake = self.netD(fake.detach())  # Detach to not update Generator weights while training the Discriminator
-				errD_fake = self.criterion(output_fake, label_fake)
+				# Hinge loss: penalize D if it overestimates fake score (want D_fake <= -1)
+				errD_fake = torch.nn.functional.relu(1.0 + output_fake).mean()
 
 				# Backward pass
 				if self.scaler:
 					self.scaler.scale(errD_fake).backward()
+					# Gradient clipping
+					self.scaler.unscale_(self.optimizerD)
+					torch.nn.utils.clip_grad_norm_(self.netD.parameters(), max_norm=1.0)
 					self.scaler.step(self.optimizerD)
 					self.scaler.update()
 				else:
 					errD_fake.backward()
+					# Gradient clipping
+					torch.nn.utils.clip_grad_norm_(self.netD.parameters(), max_norm=1.0)
 					self.optimizerD.step()
 
 			# calculate total loss (not used for training, only logging)
@@ -149,16 +203,48 @@ class DCGANTrainer:
 			with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
 				# Discriminator gets fake images
 				output = self.netD(fake)
-				errG = self.criterion(output, label_real)  # label_real, since the generator wants the discriminator to think they are real
+				# Hinge loss for G: penalize if D_fake < -1 (want D_fake high, ideally close to 1)
+				errG = -output.mean()
 
 			# Backward pass
 			if self.scaler:
 				self.scaler.scale(errG).backward()
+				# Gradient clipping
+				self.scaler.unscale_(self.optimizerG)
+				torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=1.0)
 				self.scaler.step(self.optimizerG)
 				self.scaler.update()
 			else:
 				errG.backward()
+				# Gradient clipping
+				torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=1.0)
 				self.optimizerG.step()
+
+			# Train Generator a second time per iteration with fresh noise until epoch 80
+			if epoch < 80:
+				self.netG.zero_grad(set_to_none=True)
+				with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
+					noise2 = torch.randn(b_size, self.cfg.noise_dim, 1, 1, device=self.device)
+					fake2 = self.netG(noise2)
+					output2 = self.netD(fake2)
+					errG2 = -output2.mean()
+
+				# Backward pass for second generator update
+				if self.scaler:
+					self.scaler.scale(errG2).backward()
+					# Gradient clipping
+					self.scaler.unscale_(self.optimizerG)
+					torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=1.0)
+					self.scaler.step(self.optimizerG)
+					self.scaler.update()
+				else:
+					errG2.backward()
+					# Gradient clipping
+					torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=1.0)
+					self.optimizerG.step()
+
+			# Update EMA once per iteration using the latest generator weights
+			self.update_ema()
 
 
 			if i % 50 == 0:
@@ -175,8 +261,11 @@ class DCGANTrainer:
 		"""Computes FID and IS scores."""
 		print(f"Evaluating at epoch {epoch}...")
 
-		# Switch to Eval mode
+		# Switch to Eval mode and pick EMA generator if available
+		gen_for_eval = getattr(self, "ema_netG", self.netG)
 		self.netG.eval()
+		if gen_for_eval is not self.netG:
+			gen_for_eval.eval()
 
 		num_samples = self.cfg.num_samples_eval
 		batch_size_eval = 64
@@ -206,7 +295,7 @@ class DCGANTrainer:
 		with torch.no_grad():
 			for _ in range(num_batches):
 				noise_values = torch.randn(batch_size_eval, self.cfg.noise_dim, 1, 1, device=self.device)
-				fake_batch = self.netG(noise_values)
+				fake_batch = gen_for_eval(noise_values)
 				fake_images_list.append(fake_batch.detach())
 
 		fake_images = torch.cat(fake_images_list, dim=0)[:num_samples]
@@ -223,15 +312,25 @@ class DCGANTrainer:
 			self.fid_metric.update(fake_images_denorm, real=False)
 
 			fid_score = self.fid_metric.compute()
-			self.fid_scores.append(fid_score.item())
+			fid_value = fid_score.item()
+			self.fid_scores.append(fid_value)
 			self.fid_metric.reset()
 
 			self.is_metric.update(fake_images_denorm)
 			is_score = self.is_metric.compute()  # Tuple is (mean, std)
-			self.is_scores.append(is_score[0].item())
+			is_value = is_score[0].item()
+			self.is_scores.append(is_value)
 			self.is_metric.reset()
 
 			self.epochs_list.append(epoch)
+
+			# Best FID checkpointing (EMA generator)
+			if fid_value < self.best_fid:
+				self.best_fid = fid_value
+				self.best_epoch = epoch
+				best_path = os.path.join(self.output_folder_out, "best_generator_ema.pth")
+				torch.save(gen_for_eval.state_dict(), best_path)
+				self.best_ema_path = best_path
 
 			print(f"Epoch [{epoch}/{self.cfg.num_epochs}] - FID: {fid_score:.4f}, IS: {is_score[0]:.4f}")
 		except Exception as e:
@@ -249,6 +348,7 @@ class DCGANTrainer:
 		start_time = time.monotonic()
 
 		output_folder = os.path.join(self.cfg.save_dir, f"{self.timestamp}_DCGAN_output")
+		self.output_folder_out = output_folder
 		os.makedirs(output_folder, exist_ok=True)
 
 		for epoch in range(self.cfg.num_epochs):
@@ -257,6 +357,9 @@ class DCGANTrainer:
 
 			if epoch % self.cfg.metric_eval_freq == 0:
 				self.evaluate(epoch)
+
+			# Step LR schedulers at epoch boundaries
+			self.schedulerD.step()
 
 		end_time = time.monotonic()
 		total_time = end_time - start_time
@@ -273,9 +376,11 @@ class DCGANTrainer:
 		self.netG.train()  # Switch back to train mode
 
 	def save_results(self, output_folder, total_time):
+		gen_to_save = getattr(self, "ema_netG", self.netG)
 		# Save Models
 		os.makedirs(self.cfg.model_save_path, exist_ok=True)
 		torch.save(self.netG.state_dict(), os.path.join(self.cfg.model_save_path, 'generator.pth'))
+		torch.save(gen_to_save.state_dict(), os.path.join(self.cfg.model_save_path, 'generator_ema.pth'))
 		torch.save(self.netD.state_dict(), os.path.join(self.cfg.model_save_path, 'discriminator.pth'))
 
 		# Save Plots
@@ -284,7 +389,7 @@ class DCGANTrainer:
 
 		# Generate final sample grid
 		with torch.no_grad():
-			fake_batch = self.netG(self.fixed_noise)
+			fake_batch = gen_to_save(self.fixed_noise)
 			real_batch = next(iter(self.dataloader))[0].to(self.device)
 			utils.save_image_grid(real_batch, fake_batch, output_folder, self.timestamp)
 
@@ -330,7 +435,7 @@ class DCGANTrainer:
 
 			f.write(f"Optimizer Discriminator: {self.optimizerD.__str__()}\n")
 			f.write(f"Optimizer Generator: {self.optimizerG.__str__()}\n")
-			f.write(f"Loss Function: {self.criterion.__str__()}\n")
+			#f.write(f"Loss Function: {self.criterion.__str__()}\n")
 			f.write(f"Total Training Time: {total_time:.2f} seconds\n\n")
 
 			f.write("Network Architecture:\n")

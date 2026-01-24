@@ -1,0 +1,83 @@
+fake_label from 0.0 to 0.1
+lr_d from 0.00015 to 0.0001
+gradient clipping to 1.0
+lr_d from 0.0001 to 0.0002
+lr_g from 0.0002 to 0.0001
+--
+gen aims for 1.0 instead of 0.9
+(verbesserung des fid)
+--
+random flip in dataset
+ema generator added
+(erheblich verbessert, fid)
+--
+spectral norm on D conv layers
+lr_d scheduler: MultiStepLR milestones [50], gamma 0.5 (decay after epoch 50)
+--
+lr_d base lowered to 0.00015 (reduce D strength)
+lr_d scheduler milestones moved to [30, 60], gamma 0.5 (earlier/stronger decay)
+instance noise to D inputs: sigma 0.05 decaying to 0 by epoch 80 (stabilize early training)
+--
+Fake label 0.1 -> 0.2
+D milestones [30, 60] gamma -> 0.3
+instance noise decay to epoch 120
+--
+lr_d base lowered further to 0.00012; D milestones [30,60,90] gamma 0.3 (softer D mid/late)
+fake label raised to 0.25 (keeps gradients to G when D is strong)
+R1 penalty on real images (gamma=1.0) to regularize D
+--
+Due to worsened results (recent runs saw FID rising ~200–380 and IS dropping), we rebalance:
+lr_g raised to 0.00012; lr_d kept at 0.00012 (restore G signal)
+fake label reduced to 0.1 (avoid over-smoothing)
+R1 gamma reduced to 0.5 (less D regularization pressure)
+--
+instance noise removed (baseline) to avoid starving G; will reintroduce later if helpful
+R1 applied every 16 steps (instead of every step) to reduce over-regularization
+Discriminator milestones adjusted to [40, 80] with gamma 0.5 (later, stronger taper)
+--
+Switched D schedule to cosine annealing (eta_min=0.1*lr_d) for smoother taper
+Added best-FID checkpointing: save EMA generator when FID improves
+Limit dual G steps to epochs < 80 (single G step afterward to avoid overshooting)
+--
+MAJOR UPDATE: Hinge Loss + InstanceNorm + Data Augmentation (already moving away from pure DCGAN)
+=============
+
+1. HINGE LOSS (BCEWithLogitsLoss -> Hinge Loss)
+   Why: BCEWithLogitsLoss can plateau in late training; Hinge loss provides cleaner, 
+   sharper gradients. Works synergistically with spectral norm D to maintain stable 
+   discrimination boundaries. Hinge loss objectives:
+   - D_real: minimize max(0, 1 - D(real))  -> wants D(real) ≥ 1
+   - D_fake: minimize max(0, 1 + D(fake))  -> wants D(fake) ≤ -1
+   - G:      maximize -D(fake)             -> wants D(fake) ≈ 1
+   Expect cleaner gradients, less mode collapse.
+
+2. INSTANCENORM IN GENERATOR (BatchNorm2d -> InstanceNorm2d)
+   Why: InstanceNorm normalizes each sample independently (not batch-dependent).
+   Advantages:
+   - Reduces batch statistics dependency -> more stable with small batches
+   - Encourages diversity in generated samples (no batch-wide normalization)
+   - Better style variation across samples
+   - Works well with Hinge loss (simpler, less coupled with batch dynamics)
+   Applied to layers 1-3, Final layer (Tanh) 
+   unchanged to preserve pixel value bounds
+   Expect better perceptual quality/diversity
+   Updated weight_init to handle InstanceNorm (affine=True by default).
+
+3. DATA AUGMENTATION (Enhanced)
+   Previous: RandomHorizontalFlip only
+   New:
+   - RandomHorizontalFlip (p=0.5)  → learn left/right symmetry
+   - RandomRotation (10°)           → learn rotation invariance
+   - RandomAffine (0.1 translate)   → learn translation invariance
+   - ColorJitter (0.2)              → learn color robustness
+   Why: CIFAR-10 are small 32×32 images, augmentation improves generalization
+   and teaches the generator about natural variations. Applied at train time only.
+   Expect better feature learning, less overfitting.
+--
+Adjusted augmentation to avoid rotated outputs while keeping diversity:
+- Removed RandomRotation (generated images were rotated)
+- Added RandomCrop(padding=4, reflect) + translate-only RandomAffine(degrees=0, translate=0.1)
+- Reduced ColorJitter to 0.1 (brightness/contrast/saturation) to limit hue drift
+Why: Preserve upright orientation, retain spatial diversity, keep color shifts mild. 
+   Generated Images were also rotated and moved (black edges)
+Adjustment: Removed RandomAffine translate because default fill=0 created black edge artifacts; keep RandomCrop(padding=4, reflect) for shifts without borders. ColorJitter stays at 0.1.

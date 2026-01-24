@@ -1,4 +1,5 @@
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
 
 class Generator(nn.Module):
@@ -17,25 +18,26 @@ class Generator(nn.Module):
 		super(Generator, self).__init__()
 		self.network = nn.Sequential(
 			# Project the Latent Vector (1x1) into a 4x4 feature map.
-			# bias=False because BatchNorm centers the data anyway.
+			# bias=False because InstanceNorm centers the data anyway.
 			nn.ConvTranspose2d(noise_dim, 512, 4, 1, 0, bias=False),
-			# Normalizes output to mean 0 and var 1 to stabilize training and help gradient flow.
-			nn.BatchNorm2d(512),
-			# Standard ReLU for the Generator. Allows learning non-linear patterns by zeroing negatives.
+			# InstanceNorm: normalizes each sample independently, improves diversity & style variation
+			# Better than BatchNorm for GANs as it reduces batch statistics dependency
+			# affine=True enables learnable scale/shift parameters
+			nn.InstanceNorm2d(512, affine=True),
 			nn.ReLU(True),
 
 			# Upsamples 4x4 -> 8x8. (out = (in−1)×Stride−(2×Padding) + Kernel; out = 2in - 2 -  2 + 4)
 			nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
-			nn.BatchNorm2d(256),
+			nn.InstanceNorm2d(256, affine=True),
 			nn.ReLU(True),
 
 			# Upsamples 8x8 -> 16x16. Reducing channels (depth) as image gets larger.
 			nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
-			nn.BatchNorm2d(128),
+			nn.InstanceNorm2d(128, affine=True),
 			nn.ReLU(True),
 
 			# Final Upsample 16x16 -> 32x32 (Target Image Size).
-			# No BatchNorm here: we want the raw pixel, color values, not a normalized distribution.
+			# No InstanceNorm here: we want the raw pixel, color values, not a normalized distribution.
 			nn.ConvTranspose2d(128, number_of_channels, 4, 2, 1, bias=False),
 			#  Maps all Pixel Values into the range [-1, 1], (pixels have fixed boundary, the red channel can not be 999)
 			nn.Tanh()
@@ -64,23 +66,23 @@ class Discriminator(nn.Module):
 		super().__init__()
 		layers = [
 			# Slowly reducing the Amount of Features to 1
-			nn.Conv2d(output_dimension, 128, 4, 2, 1, bias=False),
+			spectral_norm(nn.Conv2d(output_dimension, 128, 4, 2, 1, bias=False)),
 			# LeakyReLU allows a small gradient when the unit is not active,
 			# preventing "dead neurons" in the discriminator.
 			nn.LeakyReLU(0.2, inplace=True),
 
 			# Downsample: (128, 16, 16) -> (256, 8, 8)
-			nn.Conv2d(128, 256, 4, 2, 1, bias=False),
+			spectral_norm(nn.Conv2d(128, 256, 4, 2, 1, bias=False)),
 			nn.BatchNorm2d(256),
 			nn.LeakyReLU(0.2, inplace=True),
 
 			# Downsample: (256, 8, 8) -> (512, 4, 4)
-			nn.Conv2d(256, 512, 4, 2, 1, bias=False),
+			spectral_norm(nn.Conv2d(256, 512, 4, 2, 1, bias=False)),
 			nn.BatchNorm2d(512),
 			nn.LeakyReLU(0.2, inplace=True),
 
 			# Final Downsample: (512, 4, 4) -> (1, 1, 1)
-			nn.Conv2d(512, 1, 4, 1, 0, bias=False)
+			spectral_norm(nn.Conv2d(512, 1, 4, 1, 0, bias=False))
 		]
 
 		if includeSigmoid:
@@ -111,8 +113,8 @@ def weights_init(layer):
 		# weight ~ 0
 		nn.init.normal_(layer.weight.data, 0.0, 0.02)
 
-	# Batchnorm Layers
-	elif classname.find("BatchNorm") != -1:
+	# Batchnorm & InstanceNorm Layers
+	elif classname.find("BatchNorm") != -1 or classname.find("InstanceNorm") != -1:
 		# weight ~ 1 ; shift = 0
 		nn.init.normal_(layer.weight.data, 1.0, 0.02)
 		nn.init.constant_(layer.bias.data, 0)

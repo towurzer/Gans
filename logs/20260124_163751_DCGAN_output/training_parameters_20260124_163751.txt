@@ -1,0 +1,42 @@
+DCGAN Training Parameters
+=========================
+
+Date & Time: 20260124_163751
+Target Class (CIFAR-10): 1
+Number of Epochs: 200
+Batch Size: 64
+Learning Rate Generator: 0.00012
+Learning Rate Discriminator: 0.00012
+Beta1: 0.5
+Noise Dimension: 120
+Image Size: 32x32
+Number of Channels: 3
+Optimizer Discriminator: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.5, 0.999)
+    capturable: False
+    decoupled_weight_decay: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    initial_lr: 0.00012
+    lr: 1.2e-05
+    maximize: False
+    weight_decay: 0
+)
+Optimizer Generator: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.5, 0.999)
+    capturable: False
+    decoupled_weight_decay: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.00012
+    maximize: False
+    weight_decay: 0
+)
