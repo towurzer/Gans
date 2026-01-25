@@ -1,9 +1,12 @@
+import base64
+import io
 import random
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 import torchvision.utils as vutils
+from PIL import Image
 
 
 def set_seed(seed):
@@ -100,3 +103,28 @@ def save_epoch_image(gen_batch, output_folder, epoch):
 
 	plt.savefig(filename, dpi=150, bbox_inches='tight')
 	plt.close()
+
+
+def generate_single_image(Generator, device, noise_dim):
+	noise = torch.randn(1, noise_dim, 1, 1, device=device)
+	with torch.no_grad():
+		fake = Generator(noise)
+
+	# Denormalize: [-1, 1] -> [0, 1]
+	fake = (fake + 1) / 2
+	fake = torch.clamp(fake, 0, 1)
+
+	# [0]-> first image in batch -> (1, 2, 0) to change shape from Channel,Height,Width to H,W,C)
+	img_tensor = fake[0].cpu().permute(1, 2, 0).numpy()
+
+	# scale denormalized image to pixel values
+	img_scaled = (img_tensor * 255).astype('uint8')
+	pil_img = Image.fromarray(img_scaled)
+
+	# Convert to Base64 String
+	buffer = io.BytesIO()
+	pil_img.save(buffer, format='PNG')
+	buffer.seek(0)
+	img_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+	return img_base64
